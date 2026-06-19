@@ -3,6 +3,7 @@ utils/camera_handler.py
 ========================
 Wraps OpenCV VideoCapture with thread-safe frame access.
 """
+from __future__ import annotations
 
 import cv2
 import threading
