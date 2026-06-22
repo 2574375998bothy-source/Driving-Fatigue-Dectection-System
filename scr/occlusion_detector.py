@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-def is_camera_occluded(frame, dark_threshold=15, variance_threshold=10):
+def is_camera_occluded(frame, dark_threshold=15, variance_threshold=2.0):
     """
     检测摄像头是否被物理遮挡。
     主要通过检测画面是否过暗，或者画面细节（方差）极小来判断。

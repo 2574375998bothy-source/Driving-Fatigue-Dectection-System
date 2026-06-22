@@ -34,10 +34,11 @@ from utils.ui_components import StatusBadge, AlertBanner, MetricCard
 CONFIG = {
     "backend_url": "http://localhost:5000",   # ← backend URL
     "camera_index": 0,                         # 0 = default webcam
-    "frame_rate": 15,                          # frames per second to process
+    "display_rate": 30,                        # smooth camera preview FPS
+    "analysis_rate": 6,                        # heavy fatigue-analysis FPS
     "alert_cooldown": 3,                       # seconds between repeated alerts
-    "ear_threshold": 0.25,                     # Eye Aspect Ratio threshold
-    "mar_threshold": 0.6,                      # Mouth Aspect Ratio threshold
+    "ear_threshold": 0.20,                     # Eye Aspect Ratio threshold
+    "mar_threshold": 0.24,                     # Mouth Aspect Ratio threshold
     "consec_frames": 20,                       # consecutive frames for drowsy trigger
 }
 
@@ -62,6 +63,7 @@ class FatigueDetectionApp:
         self.current_page = None
         self.is_monitoring = False
         self.is_verified = False
+        self.has_sampled_face = False
         self.driver_name = tk.StringVar(value="")
         self.current_status = tk.StringVar(value="IDLE")
         self.ear_value = tk.DoubleVar(value=0.0)
@@ -85,6 +87,7 @@ class FatigueDetectionApp:
         self._setup_styles()
         self._build_layout()
         self._show_page("login")
+        threading.Thread(target=self._check_backend, daemon=True).start()
 
         # ── Cleanup on close ─────────────────────────────────────────────────
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -393,10 +396,17 @@ class FatigueDetectionApp:
         btn_frame = tk.Frame(right, bg="#F8F9FA")
         btn_frame.pack(fill="x", pady=12)
 
+        self.enroll_btn = ttk.Button(btn_frame,
+            text="1. Capture Face Samples",
+            style="Success.TButton",
+            command=self._on_start_enroll)
+        self.enroll_btn.pack(fill="x", pady=4)
+
         self.verify_btn = ttk.Button(btn_frame,
             text="▶  Begin Verification",
             style="Primary.TButton",
-            command=self._on_start_verify)
+            command=self._on_start_verify,
+            state="disabled")
         self.verify_btn.pack(fill="x", pady=4)
 
         self.verify_retry_btn = ttk.Button(btn_frame,
@@ -631,9 +641,15 @@ class FatigueDetectionApp:
             self._flash_entry()
             return
         self._log_event(f"Session started for: {name}", "INFO")
+        self.has_sampled_face = False
+        self.verify_btn.configure(state="disabled")
         self._show_page("verify")
         self.camera.start()
         self._start_verify_feed()
+
+    def _check_backend(self):
+        connected = self.api_client.check_health()
+        self.root.after(0, self._update_conn_status, connected)
 
     def _flash_entry(self):
         """Briefly highlight entry if empty."""
@@ -641,8 +657,62 @@ class FatigueDetectionApp:
         self.name_entry.configure(bg="#FFE0E0")
         self.root.after(400, lambda: self.name_entry.configure(bg=orig))
 
+    def _on_start_enroll(self):
+        """Capture multiple frames before identity verification."""
+        if not self.api_client.check_health():
+            self._update_conn_status(False)
+            messagebox.showerror(
+                "Backend unavailable",
+                "Please start the complete system with run.bat, then try sampling again.",
+            )
+            return
+        if self.camera.get_frame() is None:
+            messagebox.showwarning("Camera", "Camera not ready. Please wait.")
+            return
+        self.enroll_btn.configure(state="disabled")
+        self.verify_btn.configure(state="disabled")
+        self.verify_status.configure(text="Capturing 8 face samples...", fg="#FD7E14")
+        self.verify_result_label.configure(
+            text="Keep still and look directly at the camera", fg="#6C757D")
+        threading.Thread(target=self._do_enroll, daemon=True).start()
+
+    def _do_enroll(self):
+        frames = []
+        for _ in range(8):
+            frame = self.camera.get_frame()
+            if frame is not None:
+                frames.append(frame)
+            time.sleep(0.25)
+        result = self.api_client.enroll_identity(frames, self.driver_name.get())
+        self.root.after(0, self._on_enroll_result, result)
+
+    def _on_enroll_result(self, result: dict):
+        self.enroll_btn.configure(state="normal")
+        if result.get("status") == "enrolled":
+            self.has_sampled_face = True
+            self.verify_btn.configure(state="normal")
+            self.verify_result_icon.configure(text="OK", fg="#2DC653")
+            self.verify_result_label.configure(
+                text=f"Face sampling complete: {result.get('samples', 0)} valid samples",
+                fg="#2DC653",
+            )
+            self.verify_status.configure(
+                text="Sampling completed - now begin verification", fg="#2DC653")
+            self._log_event(
+                f"Face enrollment completed ({result.get('samples', 0)} samples)", "OK")
+        else:
+            self.has_sampled_face = False
+            self.verify_btn.configure(state="disabled")
+            message = result.get("message", "Face sampling failed")
+            self.verify_result_icon.configure(text="!", fg="#E63946")
+            self.verify_result_label.configure(text=message, fg="#E63946")
+            self.verify_status.configure(text="Sampling failed - please retry", fg="#E63946")
+
     def _on_start_verify(self):
         """Send frame to backend for face verification."""
+        if not self.has_sampled_face:
+            messagebox.showwarning("Face sampling", "Capture face samples before verification.")
+            return
         frame = self.camera.get_frame()
         if frame is None:
             messagebox.showwarning("Camera", "Camera not ready. Please wait.")
@@ -688,13 +758,14 @@ class FatigueDetectionApp:
             self.verify_status.configure(text="Access denied", fg="#E63946")
             self.alert_manager.trigger("UNAUTHORIZED")
 
-        else:  # backend offline – demo mode
-            self.verify_result_icon.configure(text="✓", fg="#2DC653")
+        else:
+            self.is_verified = False
+            self.verify_result_icon.configure(text="!", fg="#E63946")
             self.verify_result_label.configure(
-                text="Demo mode (backend offline)", fg="#6C757D")
+                text=result.get("message", "Backend or face model unavailable"), fg="#E63946")
             self.verify_status.configure(
-                text="Running in demo mode", fg="#6C757D")
-            self.root.after(1500, self._goto_monitor)
+                text="Verification could not be completed", fg="#E63946")
+            self._update_conn_status(self.api_client.check_health())
 
     def _on_retry_verify(self):
         self.verify_result_icon.configure(text="○", fg="#DEE2E6")
@@ -731,6 +802,7 @@ class FatigueDetectionApp:
         self._camera_thread = threading.Thread(
             target=self._camera_loop, daemon=True)
         self._camera_thread.start()
+        self._refresh_monitor_preview()
         self._log_event("Monitoring started", "OK")
 
     def _stop_monitoring(self):
@@ -745,6 +817,9 @@ class FatigueDetectionApp:
         if messagebox.askyesno("End Session",
             "End this monitoring session and return to login?"):
             self._stop_monitoring()
+            self.api_client.end_session()
+            self.is_verified = False
+            self.has_sampled_face = False
             self.driver_name.set("")
             self.alert_count.set(0)
             self.session_time.set("00:00:00")
@@ -775,7 +850,7 @@ class FatigueDetectionApp:
         2. Send to backend /api/analyze
         3. Update UI with returned metrics
         """
-        interval = 1.0 / CONFIG["frame_rate"]
+        interval = 1.0 / CONFIG["analysis_rate"]
         while not self._stop_event.is_set():
             t0 = time.time()
             frame = self.camera.get_frame()
@@ -783,10 +858,7 @@ class FatigueDetectionApp:
                 time.sleep(0.1)
                 continue
 
-            # Display frame on canvas (safely on main thread)
-            self.root.after(0, self._display_frame, frame, self.monitor_canvas)
-
-            # Send to backend for analysis
+            # Analysis is intentionally slower than preview rendering.
             result = self.api_client.analyze_frame(frame)
             self.root.after(0, self._process_analysis_result, result, frame)
 
@@ -794,6 +866,16 @@ class FatigueDetectionApp:
             elapsed = time.time() - t0
             sleep_t = max(0, interval - elapsed)
             time.sleep(sleep_t)
+
+    def _refresh_monitor_preview(self):
+        """Render the newest camera frame independently from model inference."""
+        if not self.is_monitoring:
+            return
+        frame = self.camera.get_frame()
+        if frame is not None:
+            self._display_frame(frame, self.monitor_canvas)
+        delay_ms = max(15, int(1000 / CONFIG["display_rate"]))
+        self.root.after(delay_ms, self._refresh_monitor_preview)
 
     def _process_analysis_result(self, result: dict, frame: np.ndarray):
         """Update metrics and trigger alerts based on backend response."""
@@ -804,6 +886,26 @@ class FatigueDetectionApp:
         mar = result.get("mar", 0.0)
         status = result.get("status", "NORMAL")
         head_pose = result.get("head_pose", "normal")
+
+        if status in ("OCCLUDED", "LOCKED", "ERROR", "NO_FACE"):
+            messages = {
+                "OCCLUDED": "CAMERA OBSTRUCTION DETECTED - ANTI-THEFT ALERT",
+                "LOCKED": result.get("message", "Session locked; identity verification required"),
+                "ERROR": result.get("message", "Backend analysis failed"),
+                "NO_FACE": "No driver face detected",
+            }
+            alert_type = "OBSTRUCTION" if status == "OCCLUDED" else "UNAUTHORIZED"
+            self._show_alert_banner(messages[status])
+            self._update_status_display(status, "#E63946", messages[status])
+            self.alert_manager.trigger(alert_type)
+            if status == "LOCKED":
+                self._stop_monitoring()
+                self.is_verified = False
+                messagebox.showwarning("Security lock", messages[status])
+                self._show_page("verify")
+                self.camera.start()
+                self._start_verify_feed()
+            return
 
         # Update metric cards
         ear_str = f"{ear:.3f}"
@@ -818,7 +920,7 @@ class FatigueDetectionApp:
             text=str(self.alert_count.get()))
 
         # Determine overall state
-        if status == "DROWSY" or ear < CONFIG["ear_threshold"]:
+        if status in ("DROWSY", "ALERT") or ear < CONFIG["ear_threshold"]:
             self._trigger_alert("DROWSY", "⚠  DROWSINESS DETECTED — Eyes closing!")
         elif status == "YAWNING" or mar > CONFIG["mar_threshold"]:
             self._trigger_alert("YAWNING", "⚠  YAWNING DETECTED — Fatigue warning!")
@@ -892,9 +994,13 @@ class FatigueDetectionApp:
             return
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
-        pil = pil.resize((w, h), Image.LANCZOS)
+        pil = pil.resize((w, h), Image.Resampling.BILINEAR)
         photo = ImageTk.PhotoImage(pil)
-        canvas.create_image(0, 0, image=photo, anchor="nw")
+        image_item = getattr(canvas, "_image_item", None)
+        if image_item is None:
+            canvas._image_item = canvas.create_image(0, 0, image=photo, anchor="nw")
+        else:
+            canvas.itemconfigure(image_item, image=photo)
         canvas._photo_ref = photo  # prevent GC
 
     def _animate_scan(self, x: int):
@@ -947,6 +1053,15 @@ class FatigueDetectionApp:
     def _on_close(self):
         self._stop_event.set()
         self.camera.stop()
+        self.api_client.end_session()
+        backend_server = getattr(self, "backend_server", None)
+        if backend_server is not None:
+            backend_server.shutdown()
+        backend_process = getattr(self, "backend_process", None)
+        if backend_process is not None and backend_process.poll() is None:
+            backend_process.terminate()
+        if getattr(self, "backend_mapped_drive", False):
+            subprocess.run(["subst", "R:", "/D"], capture_output=True, check=False)
         self.root.destroy()
 
 

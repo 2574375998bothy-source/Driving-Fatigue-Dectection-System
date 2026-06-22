@@ -1,151 +1,120 @@
-"""
-utils/api_client.py
-====================
-REST API client (replaced with local backend integration)
+"""HTTP client used by the Tkinter frontend."""
 
-This module replaces the HTTP calls with direct imports and execution of the backend
-system (integrated_system.py, fatigue_scorer.py, face_verification.py, etc.)
-so the frontend and backend run seamlessly in the same process.
-"""
+from __future__ import annotations
 
-import sys
+import os
 from pathlib import Path
-import numpy as np
+import threading
 import cv2
-import time
-
-# Add 'scr' to sys.path to import backend modules
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "scr"))
-
-try:
-    from face_verification import verify_driver
-    from compute_mar import compute_mar
-    from nod_detector import is_nodding
-    from fatigue_scorer import FatigueScorer
-    from integrated_system import get_pitch, predict_eye_closed, get_eye_crop, FACE_6_IDX, LEFT_EYE, RIGHT_EYE, MODEL_POINTS, PITCH_THRESHOLD, MAR_THRESHOLD
-    import keras
-    import mediapipe as mp
-
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True,
-                                      min_detection_confidence=0.5,
-                                      min_tracking_confidence=0.5)
-    
-    model_path = PROJECT_ROOT / "scr" / "eye_status_cnn.h5"
-    if model_path.exists():
-        eye_model = keras.models.load_model(str(model_path))
-    else:
-        print("[APIClient] WARNING: eye_status_cnn.h5 not found.")
-        eye_model = None
-
-    scorer = FatigueScorer()
-    BACKEND_AVAILABLE = True
-except Exception as e:
-    print(f"[APIClient] Backend import error: {e}")
-    BACKEND_AVAILABLE = False
+import numpy as np
+import requests
 
 
 class APIClient:
-    """
-    Handles local backend processing (replaces HTTP calls).
-    """
+    def __init__(self, base_url: str = "http://127.0.0.1:5000", timeout: float = 8.0):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session_id: str | None = None
+        self.local_mode = os.environ.get("FATIGUE_LOCAL_BACKEND") == "1"
+        self._engine = None
+        self._engine_lock = threading.Lock()
 
-    def __init__(self, base_url: str = "", timeout: float = 3.0):
-        self._last_alert_time: float = 0.0
-
-    def verify_identity(self, frame: np.ndarray, driver_name: str) -> dict:
-        """
-        Runs local face verification on the frame.
-        """
-        if not BACKEND_AVAILABLE:
-            print("[APIClient] Backend unavailable, running in demo mode.")
-            return {"status": "demo", "name": driver_name}
-            
-        try:
-            # verify_driver expects a raw frame, returns boolean
-            is_verified = verify_driver(frame)
-            if is_verified:
-                return {"status": "authorized", "name": driver_name, "confidence": 1.0}
-            else:
-                return {"status": "unauthorized", "name": "Unknown", "confidence": 0.0}
-        except Exception as exc:
-            print(f"[APIClient] verify_identity error: {exc}")
-            return {"status": "error", "name": driver_name}
-
-    def analyze_frame(self, frame: np.ndarray) -> dict:
-        """
-        Runs local fatigue detection (Mediapipe + CNN + FatigueScorer).
-        """
-        if not BACKEND_AVAILABLE:
-            return self._demo_analysis()
-            
-        try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = face_mesh.process(rgb)
-            
-            eye_closed = False
-            is_yawn = False
-            is_nod = False
-            pitch = 0.0
-            ear = 0.35 # Default mock value
-            mar = 0.0
-            
-            h, w, _ = frame.shape
-
-            if result.multi_face_landmarks:
-                lm = result.multi_face_landmarks[0].landmark
-                
-                # Check eyes
-                for eye_idx in [LEFT_EYE, RIGHT_EYE]:
-                    crop = get_eye_crop(frame, lm, eye_idx, h, w)
-                    if crop is not None and eye_model is not None:
-                        if predict_eye_closed(eye_model, crop):
-                            eye_closed = True
-                            ear = 0.15 # Mock lower EAR if closed
-                            break
-                
-                # Check mouth
-                mar_val, _ = compute_mar(lm, w, h)
-                mar = float(mar_val)
-                is_yawn = mar > MAR_THRESHOLD
-                
-                # Check head pose (pitch)
-                pitch = float(get_pitch(lm, h, w))
-                is_nod = pitch >= PITCH_THRESHOLD
-
-            score_result = scorer.update(eye_closed, is_yawn, is_nod)
-            
-            level_mapping = {
-                "OK": "NORMAL",
-                "WARNING": "DROWSY", # Map Warning to Drowsy for frontend compat
-                "ALERT": "ALERT"
-            }
-            mapped_status = level_mapping.get(score_result["level"], "NORMAL")
-            if is_yawn and mapped_status == "NORMAL":
-                mapped_status = "YAWNING"
-                
-            return {
-                "status": mapped_status,
-                "ear": round(ear, 3),
-                "mar": round(mar, 3),
-                "head_pose": "anomaly" if is_nod else "normal"
-            }
-        except Exception as exc:
-            print(f"[APIClient] analyze_frame error: {exc}")
-            return self._demo_analysis()
-
-    def check_health(self) -> bool:
-        return BACKEND_AVAILABLE
+    def _local_backend(self):
+        if self._engine is None:
+            with self._engine_lock:
+                if self._engine is None:
+                    from detection_engine import DetectionEngine
+                    project_root = Path(__file__).resolve().parent.parent
+                    self._engine = DetectionEngine(project_root / "data" / "authorized_users")
+        return self._engine
 
     @staticmethod
-    def _demo_analysis() -> dict:
-        t = time.time()
-        ear = 0.30 + 0.05 * abs((t % 6) - 3) / 3
-        mar = 0.35 + 0.10 * ((t % 10) / 10)
-        return {
-            "status":    "NORMAL",
-            "ear":       round(ear, 3),
-            "mar":       round(mar, 3),
-            "head_pose": "normal",
-        }
+    def _jpeg(frame: np.ndarray) -> tuple[str, bytes]:
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            raise ValueError("Could not encode camera frame")
+        return "frame.jpg", encoded.tobytes()
+
+    def check_health(self) -> bool:
+        if self.local_mode:
+            return True
+        try:
+            response = requests.get(f"{self.base_url}/api/health", timeout=2)
+            return response.ok and response.json().get("status") == "ok"
+        except (requests.RequestException, ValueError):
+            return False
+
+    def verify_identity(self, frame: np.ndarray, driver_name: str) -> dict:
+        if self.local_mode:
+            result = self._local_backend().verify(frame, driver_name)
+            if result.get("status") == "authorized":
+                self.session_id = result.get("session_id")
+            return result
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/verify",
+                files={"frame": self._jpeg(frame)},
+                data={"driver_name": driver_name},
+                timeout=self.timeout,
+            )
+            result = response.json()
+            if response.ok and result.get("status") == "authorized":
+                self.session_id = result.get("session_id")
+            return result
+        except requests.RequestException as exc:
+            return {"status": "error", "message": f"Backend unavailable: {exc}"}
+        except (ValueError, KeyError) as exc:
+            return {"status": "error", "message": str(exc)}
+
+    def enroll_identity(self, frames: list[np.ndarray], driver_name: str) -> dict:
+        if self.local_mode:
+            return self._local_backend().enroll(frames, driver_name)
+        try:
+            files = [("frames", self._jpeg(frame)) for frame in frames]
+            response = requests.post(
+                f"{self.base_url}/api/enroll",
+                files=files,
+                data={"driver_name": driver_name},
+                timeout=max(self.timeout, 20.0),
+            )
+            return response.json()
+        except requests.RequestException as exc:
+            return {"status": "error", "message": f"Backend unavailable: {exc}"}
+        except ValueError as exc:
+            return {"status": "error", "message": str(exc)}
+
+    def analyze_frame(self, frame: np.ndarray) -> dict:
+        if not self.session_id:
+            return {"status": "LOCKED", "message": "Driver has not been verified"}
+        if self.local_mode:
+            result, _ = self._local_backend().analyze(frame, self.session_id)
+            return result
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/analyze",
+                files={"frame": self._jpeg(frame)},
+                data={"session_id": self.session_id},
+                timeout=self.timeout,
+            )
+            return response.json()
+        except requests.RequestException as exc:
+            return {"status": "ERROR", "message": f"Backend unavailable: {exc}"}
+        except ValueError as exc:
+            return {"status": "ERROR", "message": str(exc)}
+
+    def end_session(self) -> None:
+        if self.local_mode:
+            if self.session_id and self._engine is not None:
+                self._engine.end_session(self.session_id)
+            self.session_id = None
+            return
+        if self.session_id:
+            try:
+                requests.post(
+                    f"{self.base_url}/api/session/end",
+                    json={"session_id": self.session_id},
+                    timeout=2,
+                )
+            except requests.RequestException:
+                pass
+        self.session_id = None

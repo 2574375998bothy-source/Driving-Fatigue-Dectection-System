@@ -1,166 +1,111 @@
-"""
-Phase 9: System Evaluation
-Evaluate the state machine and fatigue detection against test datasets.
-"""
-import os
-import cv2
-import numpy as np
-import mediapipe as mp
-import keras
+"""Phase 9 scenario evaluation and confusion-matrix generation."""
+
+from __future__ import annotations
+
+import json
 from pathlib import Path
 import sys
+
+import cv2
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scr"))
 
-from face_verification import verify_driver
-from occlusion_detector import is_camera_occluded
-from compute_mar import compute_mar
-from nod_detector import is_nodding
-from fatigue_scorer import FatigueScorer
+from detection_engine import DetectionEngine
 
-# Labels
-# 0: Normal (Monitor)
-# 1: Locked (Unauthorized)
-# 2: Occluded
-# 3: Fatigue Alert
+LABELS = ["Normal", "Unauthorized", "Occluded", "Fatigue"]
+TEST_CASES = [
+    ("normal_authorized.mp4", "Normal"),
+    ("unauthorized.mp4", "Unauthorized"),
+    ("occluded.mp4", "Occluded"),
+    ("fatigue.mp4", "Fatigue"),
+]
 
-LABEL_MAP = {
-    0: "Normal",
-    1: "Unauthorized",
-    2: "Occluded",
-    3: "Fatigue"
-}
 
-def predict_video_state(video_path, eye_model, face_mesh):
-    """
-    Run the state machine on a video and return the final dominant state.
-    """
-    cap = cv2.VideoCapture(video_path)
-    scorer = FatigueScorer()
-    
-    state_counts = {0:0, 1:0, 2:0, 3:0}
-    
-    # State tracking
-    is_locked = False
-    is_occluded = False
-    fatigue_alert = False
-    
-    auth_success = False
-    
-    frame_count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-        frame_count += 1
-        
-        # 1. Check Occlusion
-        if is_camera_occluded(frame):
-            state_counts[2] += 1
-            is_occluded = True
-            continue
-            
-        # 2. Check Auth (only need to succeed once for simplicity in testing)
-        if not auth_success:
-            if verify_driver(frame, str(PROJECT_ROOT / "data" / "authorized_users")):
-                auth_success = True
-            else:
-                if frame_count > 30: # If fail for 30 frames, considered locked
-                    is_locked = True
-                    state_counts[1] += 1
+def classify_video(path: Path, engine: DetectionEngine) -> str:
+    capture = cv2.VideoCapture(str(path))
+    session_id = None
+    counts = {label: 0 for label in LABELS}
+    frame_number = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frame_number += 1
+            if frame_number % 5:
                 continue
-                
-        # 3. Monitor Fatigue
-        if auth_success:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = face_mesh.process(rgb)
-            
-            eye_closed, is_yawn, is_nod = False, False, False
-            if result.multi_face_landmarks:
-                lm = result.multi_face_landmarks[0].landmark
-                h, w = frame.shape[:2]
-                
-                # Simplified check for evaluation
-                mar, _ = compute_mar(lm, w, h)
-                if mar > 0.240: is_yawn = True
-                
-            score_result = scorer.update(eye_closed, is_yawn, is_nod)
-            if score_result["level"] == "ALERT":
-                fatigue_alert = True
-                state_counts[3] += 1
-            else:
-                state_counts[0] += 1
-                
-    cap.release()
-    
-    # Logic to determine the overall video label
-    if is_locked: return 1
-    if is_occluded and state_counts[2] > frame_count * 0.5: return 2
-    if fatigue_alert: return 3
-    return 0
+            if session_id is None:
+                result = engine.verify(frame, "Evaluation driver")
+                if result["status"] == "authorized":
+                    session_id = result["session_id"]
+                    counts["Normal"] += 1
+                elif result["status"] == "obstructed":
+                    counts["Occluded"] += 1
+                else:
+                    counts["Unauthorized"] += 1
+                continue
 
-def run_evaluation():
-    print("=== System Evaluation ===")
-    
-    # Load Models
-    model_path = Path(r"D:\1\Intro\eye_classifier.keras")
-    
-    if not model_path.exists():
-         print(f"[ERROR] Model not found at {model_path}")
-         return
-         
-    eye_model = keras.models.load_model(str(model_path))
-    face_mesh = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
-    
-    # Define test data (You can add more fatigue videos from your dataset here)
-    test_cases = [
-        {"path": "data/test_videos/normal_authorized.mp4", "true_label": 0},
-        {"path": "data/test_videos/unauthorized.mp4", "true_label": 1},
-        {"path": "data/test_videos/occluded.mp4", "true_label": 2},
-        # TODO: Add your fatigue dataset paths here
-        # {"path": "path/to/fatigue_video.mp4", "true_label": 3}
-    ]
-    
-    y_true = []
-    y_pred = []
-    
-    for case in test_cases:
-        p = str(PROJECT_ROOT / case["path"])
-        if not os.path.exists(p):
-            print(f"[WARNING] Missing test file: {p}")
+            result, _ = engine.analyze(frame, session_id)
+            state = result["status"]
+            if state == "OCCLUDED":
+                counts["Occluded"] += 1
+            elif state in ("ALERT", "DROWSY", "YAWNING"):
+                counts["Fatigue"] += 1
+            elif state == "LOCKED":
+                counts["Unauthorized"] += 1
+                session_id = None
+            else:
+                counts["Normal"] += 1
+    finally:
+        capture.release()
+        if session_id:
+            engine.end_session(session_id)
+    return max(counts, key=counts.get)
+
+
+def run_evaluation() -> None:
+    engine = DetectionEngine(PROJECT_ROOT / "data" / "authorized_users")
+    video_dir = PROJECT_ROOT / "data" / "test_videos"
+    output_dir = PROJECT_ROOT / "evaluation_results"
+    output_dir.mkdir(exist_ok=True)
+
+    true_labels, predicted_labels, details = [], [], []
+    for filename, expected in TEST_CASES:
+        path = video_dir / filename
+        if not path.exists():
+            print(f"[SKIP] Missing {path}")
             continue
-            
-        print(f"Evaluating {p} ...")
-        pred = predict_video_state(p, eye_model, face_mesh)
-        y_true.append(case["true_label"])
-        y_pred.append(pred)
-        print(f"  -> True: {LABEL_MAP[case['true_label']]}, Predicted: {LABEL_MAP[pred]}")
-        
-    if not y_true:
-        print("[ERROR] No test data found. Run record_test_data.py first!")
-        return
-        
-    # Generate Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3])
-    
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=[LABEL_MAP[i] for i in range(4)],
-                yticklabels=[LABEL_MAP[i] for i in range(4)])
-    plt.title("System Evaluation - Confusion Matrix")
-    plt.xlabel("Predicted State")
-    plt.ylabel("True State")
-    
-    out_img = str(PROJECT_ROOT / "confusion_matrix.png")
-    plt.savefig(out_img)
-    print(f"\nSaved confusion matrix to: {out_img}")
-    
-    print("\nClassification Report:")
-    print(classification_report(y_true, y_pred, target_names=[LABEL_MAP[i] for i in range(4) if i in y_true], labels=list(set(y_true))))
+        predicted = classify_video(path, engine)
+        true_labels.append(expected)
+        predicted_labels.append(predicted)
+        details.append({"video": filename, "expected": expected, "predicted": predicted})
+        print(f"{filename}: expected={expected}, predicted={predicted}")
+
+    if not true_labels:
+        raise RuntimeError("No evaluation videos were found")
+
+    matrix = confusion_matrix(true_labels, predicted_labels, labels=LABELS)
+    sns.heatmap(matrix, annot=True, fmt="d", cmap="Blues", xticklabels=LABELS, yticklabels=LABELS)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title("Driver Monitoring System Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(output_dir / "confusion_matrix.png", dpi=160)
+    plt.close()
+
+    report = classification_report(
+        true_labels, predicted_labels, labels=LABELS, output_dict=True, zero_division=0
+    )
+    (output_dir / "evaluation.json").write_text(
+        json.dumps({"cases": details, "report": report}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Results saved to {output_dir}")
+
 
 if __name__ == "__main__":
     run_evaluation()

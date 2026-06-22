@@ -6,7 +6,9 @@ Wraps OpenCV VideoCapture with thread-safe frame access.
 from __future__ import annotations
 
 import cv2
+import sys
 import threading
+import time
 import numpy as np
 
 
@@ -33,13 +35,20 @@ class CameraHandler:
         """Open camera and begin background capture loop."""
         if self._running:
             return
-        self._cap = cv2.VideoCapture(self.camera_index)
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        self._cap = cv2.VideoCapture(self.camera_index, backend)
+        if not self._cap.isOpened() and sys.platform == "win32":
+            self._cap.release()
+            self._cap = cv2.VideoCapture(self.camera_index)
         if not self._cap.isOpened():
             print(f"[CameraHandler] WARNING: Camera {self.camera_index} not available.")
             return
-        # Set preferred resolution
+        # Keep only the newest frame and request a webcam-friendly format.
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self._cap.set(cv2.CAP_PROP_FPS, 30)
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -66,3 +75,5 @@ class CameraHandler:
             if ret:
                 with self._lock:
                     self._frame = frame
+            else:
+                time.sleep(0.02)
