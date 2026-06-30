@@ -539,8 +539,8 @@ class FatigueDetectionApp:
                  fg="#1A1A2E").pack(anchor="w", pady=(0, 8))
 
         thresholds = [
-            ("EAR < 0.25", "Eye closure / drowsiness",  "#E63946"),
-            ("MAR > 0.60", "Yawning detected",           "#FD7E14"),
+            (f"EAR < {CONFIG['ear_threshold']:.2f}", "Eye closure / drowsiness",  "#E63946"),
+            (f"MAR > {CONFIG['mar_threshold']:.2f}", "Yawning detected",           "#FD7E14"),
             ("Head tilt",  "Head pose anomaly",           "#6F42C1"),
         ]
         for val, desc, color in thresholds:
